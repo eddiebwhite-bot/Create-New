@@ -3,26 +3,36 @@
 <head>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <title>River Bridge Route Optimizer — Single File</title>
+  <title>River Bridge Route Optimizer — Single File (v9)</title>
+
+  <!-- Tailwind CDN for quick styling -->
   <script src="https://cdn.tailwindcss.com"></script>
-  <!-- React & Babel (for single-file JSX). For production hosting, you can prebuild. -->
-  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
-  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+
+  <!-- React 18 + ReactDOM (CDN) -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+
+  <!-- Babel to run JSX in the browser (simplifies drag‑and‑drop deploy) -->
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
   <style>
-    html,body { background:#f8fafc; }
+    html, body { height: 100%; }
+    body { background: #f8fafc; }
+    /* Basic table tweaks */
+    table { border-collapse: collapse; }
+    th, td { border-bottom: 1px solid #eee; }
   </style>
 </head>
 <body>
   <div id="root"></div>
 
   <script type="text/babel">
-    // Single-file version of "River Bridge Route Optimizer v8" with
-    // CSV download hardening (iOS/Safari fallback + delayed revoke) and
-    // print preview overlay. Google Drive features are not included in this
-    // single-file build (use the multi-file v9 if needed).
+    const { useEffect, useMemo, useRef, useState } = React;
 
-    const {useEffect, useMemo, useRef, useState} = React;
+    // ===============================
+    // River Bridge Route Optimizer + Pricing + Invoice + Driver Mode + PIN + Delivery Timestamps + Photo Proof + Print Preview (Single-file v9)
+    // (This build matches your V8 feature set, packaged as a single-file page for Netlify Drop)
+    // ===============================
 
     const LS_KEY = {
       apiKey: "rbd_route_planner_google_api_key",
@@ -38,18 +48,18 @@
       if (!Number.isFinite(seconds)) return "–";
       const hrs = Math.floor(seconds / 3600);
       const mins = Math.round((seconds % 3600) / 60);
-      if (hrs <= 0) return `${mins} min`;
-      return `${hrs} hr ${mins.toString().padStart(2, "0")} min`;
+      if (hrs <= 0) return \`\${mins} min\`;
+      return \`\${hrs} hr \${mins.toString().padStart(2, "0")} min\`;
     }
 
     function formatDistance(meters) {
       if (!Number.isFinite(meters)) return "–";
       const miles = meters / 1609.344;
-      return miles < 10 ? `${miles.toFixed(2)} mi` : `${miles.toFixed(1)} mi`;
+      return miles < 10 ? \`\${miles.toFixed(2)} mi\` : \`\${miles.toFixed(1)} mi\`;
     }
 
     function csvEscape(s) {
-      const needs = /[",\n]/.test(String(s));
+      const needs = /[",\\n]/.test(String(s));
       const x = String(s).replaceAll('"', '""');
       return needs ? \`"\${x}"\` : x;
     }
@@ -154,8 +164,8 @@
         }
       }
 
-      useEffect(() => { initCanvas(); /* eslint-disable-next-line */ }, [height]);
-      useEffect(() => { initCanvas(); /* eslint-disable-next-line */ }, [value]);
+      useEffect(() => { initCanvas(); }, [height]);
+      useEffect(() => { initCanvas(); }, [value]);
 
       function getPos(e) {
         const c = canvasRef.current; const r = c.getBoundingClientRect();
@@ -177,7 +187,7 @@
             <canvas
               ref={canvasRef}
               className="w-full"
-              style={{ height: `${height}px`, touchAction: 'none', backgroundColor: 'white' }}
+              style={{ height: \`\${height}px\`, touchAction: 'none', backgroundColor: 'white' }}
               onMouseDown={down} onMouseMove={move} onMouseUp={up} onMouseLeave={up}
               onTouchStart={down} onTouchMove={move} onTouchEnd={up}
             />
@@ -204,8 +214,8 @@
       const [useTrailer, setUseTrailer] = useState(false);
       const [addPharmacy, setAddPharmacy] = useState(false);
       const [addRush, setAddRush] = useState(false);
-      const [extraStopFee, setExtraStopFee] = useState(0);
-      const [taxRate, setTaxRate] = useState(0);
+      const [extraStopFee, setExtraStopFee] = useState(0); // per stop beyond first delivery
+      const [taxRate, setTaxRate] = useState(0); // percent
       const [paymentMethod, setPaymentMethod] = useState("Cash");
       const [logoUrl, setLogoUrl] = useState("");
 
@@ -219,13 +229,13 @@
 
       // Driver mode + PIN
       const [driverMode, setDriverMode] = useState(false);
-      const [ownerPIN, setOwnerPIN] = useState("");
-      const [adminUnlocked, setAdminUnlocked] = useState(false);
+      const [ownerPIN, setOwnerPIN] = useState(""); // stored locally
+      const [adminUnlocked, setAdminUnlocked] = useState(false); // session-only
 
       // Delivery status per stop (persisted)
       const [delivered, setDelivered] = useState([]); // [{addr, delivered, time}]
 
-      // Photo proof (NOT persisted; avoids localStorage quota)
+      // Photo proof (memory only)
       const [photos, setPhotos] = useState([]); // Array<Array<dataURL>> per stop index
 
       // Print preview
@@ -252,7 +262,8 @@
         if (savedAddrs) { try { const obj = JSON.parse(savedAddrs); setStartAddress(obj.start||""); setEndAddress(obj.end||""); setAddressesText(obj.stops||""); } catch{} }
         const savedOpts = localStorage.getItem(LS_KEY.opts);
         if (savedOpts) { try { const o = JSON.parse(savedOpts);
-          setRoundTrip(Boolean(o.roundTrip)); setOptimizeBy(o.optimizeBy||"duration"); if (o.departTime) setDepartTime(o.departTime);
+          setRoundTrip(typeof o.roundTrip === 'boolean' ? o.roundTrip : true);
+          setOptimizeBy(o.optimizeBy||"duration"); if (o.departTime) setDepartTime(o.departTime);
           setUseTrailer(Boolean(o.useTrailer)); setAddPharmacy(Boolean(o.addPharmacy)); setAddRush(Boolean(o.addRush));
           setExtraStopFee(Number(o.extraStopFee||0)); setTaxRate(Number(o.taxRate||0)); setPaymentMethod(o.paymentMethod||"Cash");
           setLogoUrl(o.logoUrl||"");
@@ -311,30 +322,11 @@
         const params = new URLSearchParams({ api:"1", origin, destination, travelmode:"driving" }); if (waypoints) params.set("waypoints", waypoints); return \`https://www.google.com/maps/dir/?\${params.toString()}\`;
       }
 
-      // Hardened CSV download: iOS/Safari fallback + delayed revoke to avoid "file not found"
       function downloadCSV(rows, filename="route_manifest.csv"){
         const header = ["Stop #","Address","Leg Distance (mi)","Leg Time (min)","Cumulative Distance (mi)","ETA","Delivered","Delivered At"];
         const csv = [header,...rows].map(r=>r.map(csvEscape).join(",")).join("\\n");
-        const blob = new Blob([csv], { type:"text/csv;charset=utf-8;" });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement("a");
-
-        const isIOS = /iP(ad|hone|od)/i.test(navigator.userAgent);
-        const supportsDownload = "download" in a;
-
-        if (!supportsDownload || isIOS) {
-          // Open in a new tab to allow Share/Save on iOS
-          window.open(url, "_blank");
-          setTimeout(()=>URL.revokeObjectURL(url), 10000);
-          return;
-        }
-
-        a.href = url; a.download = filename;
-        document.body.appendChild(a);
-        a.click();
-        a.remove();
-        // Delay revoke so slower browsers can read the blob
-        setTimeout(()=>URL.revokeObjectURL(url), 1000);
+        const blob = new Blob([csv], { type:"text/csv;charset=utf-8;" }); const url = URL.createObjectURL(blob);
+        const a = document.createElement("a"); a.href = url; a.download = filename; document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
       }
 
       function buildDocHTML(data){
@@ -550,7 +542,7 @@
 
       function GenerateInvoiceButton(){
         if (!result) return null;
-        const miles = result.totalMiles; const deliveredStops = Math.max(0, result.ordered.length - 1);
+        const miles = result.totalMiles; const deliveredStops = Math.max(0, result.ordered.length - 1); // exclude origin in count
         const subtotal = computeSubtotal(miles, deliveredStops);
         const tax = (Number(taxRate||0)/100) * subtotal; const total = subtotal + tax;
 
@@ -693,7 +685,7 @@
               <div className="w-10 h-10 rounded-2xl bg-blue-600 flex items-center justify-center text-white font-bold">RBD</div>
               <div className="flex-1">
                 <h1 className="text-xl font-semibold leading-tight">River Bridge Route Optimizer</h1>
-                <p className="text-xs text-gray-500">Plan routes, capture signatures, mark delivered, attach photos, and print paperwork.</p>
+                <p className="text-xs text-gray-500">Plan routes, capture signatures, photos, mark delivered, and print paperwork.</p>
               </div>
               <DriverModeToggle />
             </div>
@@ -731,7 +723,7 @@
                   <label htmlFor="roundTrip" className="text-sm">Return to Start (Round Trip)</label>
                 </div>
                 <label className="block text-sm font-medium pt-2">Delivery Stops (one per line)</label>
-                <textarea className="w-full border rounded-xl px-3 py-2 h-44" placeholder={`Example:\nCVS Pharmacy, 483 John R Junkin Dr, Natchez, MS\nLowe's, 609 S Promenade, Vidalia, LA`} value={addressesText} onChange={(e)=>setAddressesText(e.target.value)} />
+                <textarea className="w-full border rounded-xl px-3 py-2 h-44" placeholder={\`Example:\\nCVS Pharmacy, 483 John R Junkin Dr, Natchez, MS\\nLowe's, 609 S Promenade, Vidalia, LA\`} value={addressesText} onChange={(e)=>setAddressesText(e.target.value)} />
                 <div className="text-xs text-gray-500">Tip: If you leave Start empty, the first stop becomes the starting point.</div>
               </div>
 
@@ -767,7 +759,7 @@
                     </div>
                     <div>
                       <label className="block text-sm font-medium">Owner PIN (4 digits)</label>
-                      <input type="password" inputMode="numeric" pattern="[0-9]*" maxLength={4} placeholder="Set a PIN" className="w-full border rounded-xl px-3 py-2" value={ownerPIN} onChange={(e)=>{ setOwnerPIN(e.target.value.replace(/\D/g, '').slice(0,4)); setAdminUnlocked(false); }} />
+                      <input type="password" inputMode="numeric" pattern="[0-9]*" maxLength={4} placeholder="Set a PIN" className="w-full border rounded-xl px-3 py-2" value={ownerPIN} onChange={(e)=>{ setOwnerPIN(e.target.value.replace(/\\D/g, '').slice(0,4)); setAdminUnlocked(false); }} />
                       <div className="text-xs text-gray-500 mt-1">Required to exit Driver Mode when set.</div>
                     </div>
                   </div>
@@ -849,7 +841,17 @@
                                   </label>
                                 )}
                               </td>
-                              <td className="py-2 pr-3"><PhotosCell idx={idx} /></td>
+                              <td className="py-2 pr-3">
+                                <div className="flex flex-col gap-1">
+                                  <PhotosCell idx={idx} />
+                                  {/* preview */}
+                                  {photos[idx]?.length ? (
+                                    <div className="flex flex-wrap gap-1">
+                                      {photos[idx].map((u, j) => <img key={j} src={u} alt="" className="h-12 w-12 object-cover rounded-md border" />)}
+                                    </div>
+                                  ) : null}
+                                </div>
+                              </td>
                             </tr>
                           );
                         })}
@@ -868,7 +870,7 @@
                     </table>
                   </div>
                 )}
-                <div className="text-xs text-gray-500 mt-2">Photo proof is included in the printout. It is not persisted to your device.</div>
+                <div className="text-xs text-gray-500 mt-2">Photo proof is included in the printout. Stored only for this session (not persisted).</div>
               </div>
 
               <div className="rounded-2xl bg-white shadow p-1">
@@ -876,7 +878,7 @@
               </div>
 
               <div className="rounded-2xl bg-white shadow p-4 text-xs text-gray-500 space-y-1">
-                <div><b>Privacy:</b> API key, addresses, signatures, and delivered status stay on your device. Nothing is uploaded by this app.</div>
+                <div><b>Privacy:</b> Your API key, addresses, signatures, delivered status stay on your device.</div>
                 <div><b>Limits:</b> Up to 25 total points (origin + waypoints + destination) per route for Google Directions.</div>
                 <div><b>Tip:</b> Share <code>?driver=1</code> as the URL parameter to open directly in Driver Mode. Set an Owner PIN to restrict exiting Driver Mode.</div>
               </div>
