@@ -1,0 +1,897 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>River Bridge Route Optimizer — Single File</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- React & Babel (for single-file JSX). For production hosting, you can prebuild. -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    html,body { background:#f8fafc; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    // Single-file version of "River Bridge Route Optimizer v8" with
+    // CSV download hardening (iOS/Safari fallback + delayed revoke) and
+    // print preview overlay. Google Drive features are not included in this
+    // single-file build (use the multi-file v9 if needed).
+
+    const {useEffect, useMemo, useRef, useState} = React;
+
+    const LS_KEY = {
+      apiKey: "rbd_route_planner_google_api_key",
+      addresses: "rbd_route_planner_addresses",
+      opts: "rbd_route_planner_options",
+    };
+
+    const MAX_STOPS = 25; // (origin + waypoints + destination)
+
+    function classNames(...xs) { return xs.filter(Boolean).join(" "); }
+
+    function formatDuration(seconds) {
+      if (!Number.isFinite(seconds)) return "–";
+      const hrs = Math.floor(seconds / 3600);
+      const mins = Math.round((seconds % 3600) / 60);
+      if (hrs <= 0) return `${mins} min`;
+      return `${hrs} hr ${mins.toString().padStart(2, "0")} min`;
+    }
+
+    function formatDistance(meters) {
+      if (!Number.isFinite(meters)) return "–";
+      const miles = meters / 1609.344;
+      return miles < 10 ? `${miles.toFixed(2)} mi` : `${miles.toFixed(1)} mi`;
+    }
+
+    function csvEscape(s) {
+      const needs = /[",\n]/.test(String(s));
+      const x = String(s).replaceAll('"', '""');
+      return needs ? \`"\${x}"\` : x;
+    }
+
+    async function loadGoogleMapsJs(apiKey) {
+      if (typeof window !== "undefined" && window.google && window.google.maps) return window.google;
+      if (!apiKey) throw new Error("Google Maps API key is required");
+      return new Promise((resolve, reject) => {
+        const existing = document.getElementById("gmaps-js");
+        if (existing) {
+          existing.addEventListener("load", () => resolve(window.google));
+          existing.addEventListener("error", () => reject(new Error("Failed to load Google Maps JS")));
+          return;
+        }
+        const script = document.createElement("script");
+        script.id = "gmaps-js"; script.async = true; script.defer = true;
+        script.src = \`https://maps.googleapis.com/maps/api/js?key=\${encodeURIComponent(apiKey)}&libraries=places\`;
+        script.onload = () => resolve(window.google);
+        script.onerror = () => reject(new Error("Failed to load Google Maps JS"));
+        document.head.appendChild(script);
+      });
+    }
+
+    // Image compression (for photo proof)
+    function compressImageFile(file, maxW = 1200, quality = 0.8) {
+      return new Promise((resolve, reject) => {
+        const fr = new FileReader();
+        fr.onload = () => {
+          const img = new Image();
+          img.onload = () => {
+            const scale = Math.min(1, maxW / img.width);
+            const w = Math.round(img.width * scale), h = Math.round(img.height * scale);
+            const c = document.createElement('canvas'); c.width = w; c.height = h;
+            const ctx = c.getContext('2d'); ctx.drawImage(img, 0, 0, w, h);
+            try { const data = c.toDataURL('image/jpeg', quality); resolve(data); } catch (e) { reject(e); }
+          };
+          img.onerror = reject;
+          img.src = fr.result;
+        };
+        fr.onerror = reject;
+        fr.readAsDataURL(file);
+      });
+    }
+
+    // Nearest-neighbor + 2-opt heuristic for ordering stops
+    function tspHeuristic(distanceMatrix, startIdx = 0, endIdx = null) {
+      const N = distanceMatrix.length;
+      const allIdx = [...Array(N).keys()];
+      const unvisited = new Set(allIdx);
+      unvisited.delete(startIdx);
+      if (endIdx !== null && endIdx !== startIdx) unvisited.delete(endIdx);
+      const route = [startIdx];
+      let current = startIdx;
+      while (unvisited.size) {
+        let best = null, bestCost = Infinity;
+        for (const j of unvisited) {
+          const c = distanceMatrix[current][j] ?? Infinity;
+          if (c < bestCost) { best = j; bestCost = c; }
+        }
+        route.push(best); unvisited.delete(best); current = best;
+      }
+      if (endIdx !== null && endIdx !== startIdx) route.push(endIdx); else route.push(startIdx);
+
+      function routeCost(r){ let t=0; for(let i=0;i<r.length-1;i++){ t += distanceMatrix[r[i]][r[i+1]] ?? Infinity; } return t; }
+
+      let improved = true;
+      while (improved) {
+        improved = false;
+        for (let i = 1; i < route.length - 2; i++) {
+          for (let k = i + 1; k < route.length - 1; k++) {
+            const a = route[i-1], b = route[i], c = route[k], d = route[k+1];
+            const delta = (distanceMatrix[a][c] + distanceMatrix[b][d]) - (distanceMatrix[a][b] + distanceMatrix[c][d]);
+            if (delta < -1e-6) { const rev = route.slice(i, k+1).reverse(); route.splice(i, k-i+1, ...rev); improved = true; }
+          }
+        }
+      }
+      return { route, cost: routeCost(route) };
+    }
+
+    // ===============================
+    // Signature Pad (touch + mouse) — saves as compressed JPEG
+    // ===============================
+    function SignaturePad({ value, onChange, height = 140 }) {
+      const canvasRef = useRef(null);
+      const [isDrawing, setIsDrawing] = useState(false);
+      const [dirty, setDirty] = useState(false);
+
+      function initCanvas() {
+        const canvas = canvasRef.current; if (!canvas) return;
+        const ctx = canvas.getContext("2d");
+        const ratio = window.devicePixelRatio || 1;
+        const width = canvas.offsetWidth;
+        const h = height;
+        canvas.width = width * ratio;
+        canvas.height = h * ratio;
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.scale(ratio, ratio);
+        ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, width, h);
+        ctx.lineWidth = 2; ctx.lineCap = "round"; ctx.strokeStyle = "#111";
+        if (value) {
+          const img = new Image(); img.onload = () => ctx.drawImage(img, 0, 0, width, h); img.src = value;
+        }
+      }
+
+      useEffect(() => { initCanvas(); /* eslint-disable-next-line */ }, [height]);
+      useEffect(() => { initCanvas(); /* eslint-disable-next-line */ }, [value]);
+
+      function getPos(e) {
+        const c = canvasRef.current; const r = c.getBoundingClientRect();
+        const cx = ("touches" in e && e.touches.length ? e.touches[0].clientX : e.clientX);
+        const cy = ("touches" in e && e.touches.length ? e.touches[0].clientY : e.clientY);
+        return { x: cx - r.left, y: cy - r.top };
+      }
+
+      function down(e) { e.preventDefault(); const ctx = canvasRef.current.getContext("2d"); const { x, y } = getPos(e); ctx.beginPath(); ctx.moveTo(x, y); setIsDrawing(true); }
+      function move(e) { if (!isDrawing) return; e.preventDefault(); const ctx = canvasRef.current.getContext("2d"); const { x, y } = getPos(e); ctx.lineTo(x, y); ctx.stroke(); setDirty(true); }
+      function up() { setIsDrawing(false); }
+
+      function clear() { initCanvas(); setDirty(false); onChange("", null); }
+      function save() { const dataUrl = canvasRef.current.toDataURL("image/jpeg", 0.85); onChange(dataUrl, new Date()); setDirty(false); }
+
+      return (
+        <div className="space-y-2">
+          <div className="border rounded-xl bg-white overflow-hidden select-none">
+            <canvas
+              ref={canvasRef}
+              className="w-full"
+              style={{ height: `${height}px`, touchAction: 'none', backgroundColor: 'white' }}
+              onMouseDown={down} onMouseMove={move} onMouseUp={up} onMouseLeave={up}
+              onTouchStart={down} onTouchMove={move} onTouchEnd={up}
+            />
+          </div>
+          <div className="flex gap-2 text-xs">
+            <button type="button" onClick={clear} className="px-3 py-1 rounded-lg border">Clear</button>
+            <button type="button" onClick={save} className="px-3 py-1 rounded-lg border">Save Signature</button>
+            {dirty ? <span className="self-center text-gray-500">(unsaved)</span> : (value ? <span className="self-center text-green-600">Saved</span> : null)}
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [apiKey, setApiKey] = useState("");
+      const [startAddress, setStartAddress] = useState("");
+      const [endAddress, setEndAddress] = useState("");
+      const [addressesText, setAddressesText] = useState("");
+      const [roundTrip, setRoundTrip] = useState(true);
+      const [optimizeBy, setOptimizeBy] = useState("duration");
+      const [departTime, setDepartTime] = useState(() => new Date().toISOString().slice(0, 16));
+
+      // Pricing toggles
+      const [useTrailer, setUseTrailer] = useState(false);
+      const [addPharmacy, setAddPharmacy] = useState(false);
+      const [addRush, setAddRush] = useState(false);
+      const [extraStopFee, setExtraStopFee] = useState(0);
+      const [taxRate, setTaxRate] = useState(0);
+      const [paymentMethod, setPaymentMethod] = useState("Cash");
+      const [logoUrl, setLogoUrl] = useState("");
+
+      // Signatures & names
+      const [customerName, setCustomerName] = useState("");
+      const [driverName, setDriverName] = useState("");
+      const [customerSigDataUrl, setCustomerSigDataUrl] = useState("");
+      const [driverSigDataUrl, setDriverSigDataUrl] = useState("");
+      const [customerSigTime, setCustomerSigTime] = useState("");
+      const [driverSigTime, setDriverSigTime] = useState("");
+
+      // Driver mode + PIN
+      const [driverMode, setDriverMode] = useState(false);
+      const [ownerPIN, setOwnerPIN] = useState("");
+      const [adminUnlocked, setAdminUnlocked] = useState(false);
+
+      // Delivery status per stop (persisted)
+      const [delivered, setDelivered] = useState([]); // [{addr, delivered, time}]
+
+      // Photo proof (NOT persisted; avoids localStorage quota)
+      const [photos, setPhotos] = useState([]); // Array<Array<dataURL>> per stop index
+
+      // Print preview
+      const [printDoc, setPrintDoc] = useState({ open:false, html: "" });
+      const printFrameRef = useRef(null);
+
+      const [isLoadingMaps, setIsLoadingMaps] = useState(false);
+      const [isLoadedMaps, setIsLoadedMaps] = useState(false);
+      const [isOptimizing, setIsOptimizing] = useState(false);
+      const [error, setError] = useState("");
+
+      const mapRef = useRef(null);
+      const mapObj = useRef(null);
+      const dirRenderer = useRef(null);
+
+      // Load from localStorage + URL param
+      useEffect(() => {
+        const url = new URL(window.location.href);
+        const driverParam = url.searchParams.get("driver");
+        if (driverParam === "1" || driverParam === "true") setDriverMode(true);
+
+        const savedKey = localStorage.getItem(LS_KEY.apiKey); if (savedKey) setApiKey(savedKey);
+        const savedAddrs = localStorage.getItem(LS_KEY.addresses);
+        if (savedAddrs) { try { const obj = JSON.parse(savedAddrs); setStartAddress(obj.start||""); setEndAddress(obj.end||""); setAddressesText(obj.stops||""); } catch{} }
+        const savedOpts = localStorage.getItem(LS_KEY.opts);
+        if (savedOpts) { try { const o = JSON.parse(savedOpts);
+          setRoundTrip(Boolean(o.roundTrip)); setOptimizeBy(o.optimizeBy||"duration"); if (o.departTime) setDepartTime(o.departTime);
+          setUseTrailer(Boolean(o.useTrailer)); setAddPharmacy(Boolean(o.addPharmacy)); setAddRush(Boolean(o.addRush));
+          setExtraStopFee(Number(o.extraStopFee||0)); setTaxRate(Number(o.taxRate||0)); setPaymentMethod(o.paymentMethod||"Cash");
+          setLogoUrl(o.logoUrl||"");
+          setCustomerName(o.customerName||""); setDriverName(o.driverName||"");
+          setCustomerSigDataUrl(o.customerSigDataUrl||""); setDriverSigDataUrl(o.driverSigDataUrl||"");
+          setCustomerSigTime(o.customerSigTime||""); setDriverSigTime(o.driverSigTime||"");
+          if (typeof o.driverMode === 'boolean') setDriverMode(o.driverMode);
+          setOwnerPIN(o.ownerPIN||"");
+          if (Array.isArray(o.delivered)) setDelivered(o.delivered);
+        } catch{} }
+      }, []);
+
+      // Persist
+      useEffect(() => { localStorage.setItem(LS_KEY.apiKey, apiKey||""); }, [apiKey]);
+      useEffect(() => { localStorage.setItem(LS_KEY.addresses, JSON.stringify({ start:startAddress, end:endAddress, stops:addressesText })); }, [startAddress,endAddress,addressesText]);
+      useEffect(() => { localStorage.setItem(LS_KEY.opts, JSON.stringify({ roundTrip, optimizeBy, departTime, useTrailer, addPharmacy, addRush, extraStopFee, taxRate, paymentMethod, logoUrl, customerName, driverName, customerSigDataUrl, driverSigDataUrl, customerSigTime, driverSigTime, driverMode, ownerPIN, delivered })); }, [roundTrip,optimizeBy,departTime,useTrailer,addPharmacy,addRush,extraStopFee,taxRate,paymentMethod,logoUrl,customerName,driverName,customerSigDataUrl,driverSigDataUrl,customerSigTime,driverSigTime,driverMode,ownerPIN,delivered]);
+
+      // Pricing helpers
+      function baseMileagePrice(totalMiles){
+        const base = 20; const over5 = Math.max(0, totalMiles - 5); return base + 2 * over5;
+      }
+      function trailerMileagePrice(totalMiles){
+        const base = 30; const first5 = Math.min(5, totalMiles); const over5 = Math.max(0, totalMiles - 5);
+        return base + 2 * first5 + 3 * over5;
+      }
+      function computeSubtotal(totalMiles, deliveredStops){
+        const mileage = useTrailer ? trailerMileagePrice(totalMiles) : baseMileagePrice(totalMiles);
+        const pharmacy = addPharmacy ? 10 : 0; const rush = addRush ? 5 : 0;
+        const extraStops = Math.max(0, deliveredStops - 1) * Number(extraStopFee||0);
+        return mileage + pharmacy + rush + extraStops;
+      }
+
+      const stops = useMemo(() => addressesText.split(/\\n+/).map(s=>s.trim()).filter(Boolean), [addressesText]);
+
+      async function ensureMapsLoaded(){
+        if (isLoadedMaps) return; setIsLoadingMaps(true); setError("");
+        try { await loadGoogleMapsJs(apiKey); setIsLoadedMaps(true);
+          if (mapRef.current && !mapObj.current) { mapObj.current = new window.google.maps.Map(mapRef.current, { center:{lat:31.5668,lng:-91.4254}, zoom:10, mapTypeControl:false, streetViewControl:false, fullscreenControl:false }); }
+        } catch(e){ setError(e.message||String(e)); } finally { setIsLoadingMaps(false); }
+      }
+
+      async function computeDistanceRow(google, origin, destinations){
+        return new Promise((resolve,reject)=>{
+          const svc = new google.maps.DistanceMatrixService();
+          svc.getDistanceMatrix({ origins:[origin], destinations, travelMode: google.maps.TravelMode.DRIVING, unitSystem: google.maps.UnitSystem.IMPERIAL }, (res,status)=>{
+            if(status!=="OK") return reject(new Error("DistanceMatrix error: "+status));
+            try { const row = res.rows[0].elements.map(el=>({ duration: el.duration?.value ?? Infinity, distance: el.distance?.value ?? Infinity, status: el.status })); resolve(row); } catch(err){ reject(err); }
+          });
+        });
+      }
+
+      function buildDirLink(orderAddrs){
+        if(orderAddrs.length<2) return ""; const origin = encodeURIComponent(orderAddrs[0]);
+        const destination = encodeURIComponent(orderAddrs[orderAddrs.length-1]);
+        const waypoints = orderAddrs.slice(1,-1).map(encodeURIComponent).join("|");
+        const params = new URLSearchParams({ api:"1", origin, destination, travelmode:"driving" }); if (waypoints) params.set("waypoints", waypoints); return \`https://www.google.com/maps/dir/?\${params.toString()}\`;
+      }
+
+      // Hardened CSV download: iOS/Safari fallback + delayed revoke to avoid "file not found"
+      function downloadCSV(rows, filename="route_manifest.csv"){
+        const header = ["Stop #","Address","Leg Distance (mi)","Leg Time (min)","Cumulative Distance (mi)","ETA","Delivered","Delivered At"];
+        const csv = [header,...rows].map(r=>r.map(csvEscape).join(",")).join("\\n");
+        const blob = new Blob([csv], { type:"text/csv;charset=utf-8;" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+
+        const isIOS = /iP(ad|hone|od)/i.test(navigator.userAgent);
+        const supportsDownload = "download" in a;
+
+        if (!supportsDownload || isIOS) {
+          // Open in a new tab to allow Share/Save on iOS
+          window.open(url, "_blank");
+          setTimeout(()=>URL.revokeObjectURL(url), 10000);
+          return;
+        }
+
+        a.href = url; a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        // Delay revoke so slower browsers can read the blob
+        setTimeout(()=>URL.revokeObjectURL(url), 1000);
+      }
+
+      function buildDocHTML(data){
+        const fmt = (n)=>\`$\${n.toFixed(2)}\`;
+        const today = new Date().toLocaleString();
+        const rowsHtml = data.lines.map(([label, qty, rate, amt])=>\`<tr><td>\${label}</td><td style="text-align:center">\${qty}</td><td style="text-align:right">\${rate}</td><td style="text-align:right">\${amt}</td></tr>\`).join("");
+        const stopsHtml = data.stops.map((s,i)=>\`<li><strong>\${i+1}.</strong> \${s}</li>\`).join("");
+        const logo = data.logoUrl ? \`<img src="\${data.logoUrl}" alt="Logo" style="height:56px;object-fit:contain;max-width:260px" />\` : "";
+
+        const custSig = data.customerSig ? \`<img src="\${data.customerSig}" alt="Customer Signature" style="height:60px;object-fit:contain;border-bottom:1px solid #333" />\` : \`<div class="sig"></div>\`;
+        const drvSig = data.driverSig ? \`<img src="\${data.driverSig}" alt="Driver Signature" style="height:60px;object-fit:contain;border-bottom:1px solid #333" />\` : \`<div class="sig"></div>\`;
+
+        const statusHtml = (data.delivered && data.delivered.length) ? \`<div class="box"><strong>Delivery Status</strong><ol>\${data.delivered.map((d,i)=>\`<li><strong>\${i+1}.</strong> \${d.addr} — \${d.delivered ? 'Delivered' : '—'} \${d.time ? '• ' + new Date(d.time).toLocaleString() : ''}</li>\`).join("")}</ol></div>\` : '';
+
+        const photosHtml = (data.photos && data.photos.some(p=>p && p.length)) ? \`<div class="box"><strong>Photo Proof</strong>\${data.photos.map((arr,idx)=> (arr && arr.length) ? \`<div style="margin:8px 0"><div style="font-size:12px;color:#444;margin-bottom:4px"><strong>\${idx+1}.</strong> \${data.stops[idx]||''}</div><div style="display:flex;flex-wrap:wrap;gap:8px">\${arr.map(u=>\`<img src="\${u}" style="height:120px;object-fit:cover;border:1px solid #ddd;border-radius:8px"/>\`).join('')}</div></div>\` : '').join('')}</div>\` : '';
+
+        return \`<!doctype html><html><head><meta charset="utf-8"/><title>\${data.mode === 'receipt' ? 'Delivery Receipt' : 'RBD Invoice'}</title>
+          <style>
+            body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif; margin:32px; color:#111}
+            h1{margin:0 0 6px}
+            .muted{color:#666;font-size:12px}
+            .box{border:1px solid #ddd;border-radius:12px;padding:16px;margin:12px 0}
+            table{width:100%;border-collapse:collapse;margin-top:8px}
+            th,td{border-bottom:1px solid #eee;padding:8px}
+            th{background:#fafafa;text-align:left}
+            .totals td{border:none;padding:6px}
+            .right{text-align:right}
+            .badge{display:inline-block;padding:4px 10px;border-radius:999px;background:#eef;border:1px solid #cde;color:#225}
+            .sig{height:60px;border-bottom:1px solid #333}
+            .sigrow{display:grid;grid-template-columns:1fr 1fr;gap:24px;margin-top:16px}
+            .siglabel{font-size:12px;color:#444;margin-top:4px}
+            @media print {.noprint{display:none}}
+          </style>
+        </head><body>
+          <div style="display:flex;align-items:center;gap:16px;justify-content:space-between">
+            <div style="display:flex;align-items:center;gap:12px">
+              \${logo}
+              <div>
+                <h1>River Bridge Delivery</h1>
+                <div class="muted">Your Local Delivery Connection</div>
+                <div class="muted">Phone: <a href="tel:318-804-7497">318-804-7497</a> • Email: <a href="mailto:riverbridgedelivery@gmail.com">riverbridgedelivery@gmail.com</a></div>
+              </div>
+            </div>
+            <div><span class="badge">\${data.paymentMethod}</span></div>
+          </div>
+
+          <div class="box">
+            <div><strong>\${data.mode === 'receipt' ? 'Receipt Date' : 'Invoice Date'}:</strong> \${today}</div>
+            <div><strong>Route:</strong> \${data.miles.toFixed(2)} miles • \${data.duration}</div>
+            <div><strong>Trailer:</strong> \${data.useTrailer ? "Yes" : "No"} • <strong>Pharmacy:</strong> \${data.addPharmacy?"Yes":"No"} • <strong>Rush:</strong> \${data.addRush?"Yes":"No"}</div>
+          </div>
+
+          <div class="box">
+            <strong>Stops (\${data.stops.length})</strong>
+            <ol>\${stopsHtml}</ol>
+          </div>
+
+          \${data.mode === 'invoice' ? \`
+          <div class="box">
+            <strong>Line Items</strong>
+            <table>
+              <thead><tr><th>Item</th><th style="text-align:center">Qty</th><th class="right">Rate</th><th class="right">Amount</th></tr></thead>
+              <tbody>\${rowsHtml}</tbody>
+            </table>
+            <table class="totals" style="margin-top:8px; width:100%">
+              <tr><td class="right" style="width:80%"><strong>Subtotal:</strong></td><td class="right" style="width:20%">\${fmt(data.subtotal)}</td></tr>
+              <tr><td class="right"><strong>Tax (\${data.taxRate}%):</strong></td><td class="right">\${fmt(data.tax)}</td></tr>
+              <tr><td class="right"><strong>Total:</strong></td><td class="right"><strong>\${fmt(data.total)}</strong></td></tr>
+            </table>
+          </div>\` : ''}
+
+          \${statusHtml}
+          \${photosHtml}
+
+          <div class="box">
+            <strong>Signatures</strong>
+            <div class="sigrow">
+              <div>
+                \${custSig}
+                <div class="siglabel">Customer Signature \${data.customerName ? \`— \${data.customerName}\` : ''} \${data.customerSigTime ? \`• \${data.customerSigTime}\` : ''}</div>
+              </div>
+              <div>
+                \${drvSig}
+                <div class="siglabel">Driver Signature \${data.driverName ? \`— \${data.driverName}\` : ''} \${data.driverSigTime ? \`• \${data.driverSigTime}\` : ''}</div>
+              </div>
+            </div>
+          </div>
+
+          <p class="muted">HIPAA Certified Annually • No‑Touch Delivery — You Load, We Drive • Professional CDL Licensed Driver</p>
+          <button class="noprint" onclick="window.print()">Print / Save as PDF</button>
+        </body></html>\`;
+      }
+
+      function openPrintPreview(data){
+        const html = buildDocHTML(data);
+        setPrintDoc({ open:true, html });
+      }
+
+      const [result, setResult] = useState(null);
+
+      async function onOptimize(){
+        setError(""); setResult(null);
+        if (!apiKey) { setError("Please paste your Google Maps API key."); return; }
+
+        const list = stops.slice();
+        let origin = startAddress || (list.length ? list.shift() : "");
+        let destination = endAddress && !roundTrip ? endAddress : origin;
+        if (!origin) { setError("Enter at least one address (either Start or a Stop)."); return; }
+
+        const allAddrs = [origin, ...list];
+        if (!roundTrip && destination !== origin) allAddrs.push(destination);
+        if (allAddrs.length > MAX_STOPS) { setError(\`Too many total points (\${allAddrs.length}). Max \${MAX_STOPS}.\`); return; }
+
+        try {
+          setIsOptimizing(true);
+          await ensureMapsLoaded();
+          const google = window.google;
+          const D_time = [], D_dist = [];
+          for (let i = 0; i < allAddrs.length; i++) {
+            const row = await computeDistanceRow(google, allAddrs[i], allAddrs);
+            D_time.push(row.map(x=>x.duration)); D_dist.push(row.map(x=>x.distance));
+          }
+          const startIdx = 0; let endIdx = null; if (!roundTrip) endIdx = allAddrs.length - 1;
+          const metric = optimizeBy === "distance" ? D_dist : D_time;
+          const { route } = tspHeuristic(metric, startIdx, endIdx);
+          const ordered = route.map(i => allAddrs[i]);
+
+          let totalSeconds = 0, totalMeters = 0; const legs = [];
+          for (let i = 0; i < route.length - 1; i++) {
+            const a = route[i], b = route[i+1];
+            const sec = D_time[a][b], met = D_dist[a][b];
+            legs.push({ seconds: sec, meters: met }); totalSeconds += sec; totalMeters += met;
+          }
+          const depart = new Date(departTime || new Date());
+          const etaList = []; let cum = 0; for (let i=0;i<legs.length;i++){ cum += legs[i].seconds; etaList.push(new Date(depart.getTime()+cum*1000)); }
+
+          // Align delivered with saved data by address
+          let newDelivered = ordered.map(addr => ({ addr, delivered:false, time:"" }));
+          if (delivered && delivered.length) {
+            const map = new Map(delivered.map(d => [d.addr, d]));
+            newDelivered = ordered.map(addr => map.get(addr) || { addr, delivered:false, time:"" });
+          }
+
+          // Reset photos to match new ordering length
+          const newPhotos = ordered.map(() => []);
+
+          // Draw route if map present
+          let directionsUrl = "";
+          if (mapObj.current && window.google) {
+            const g = window.google; const dsvc = new g.maps.DirectionsService();
+            if (!dirRenderer.current) { dirRenderer.current = new g.maps.DirectionsRenderer({ suppressMarkers:false }); dirRenderer.current.setMap(mapObj.current); }
+            const waypoints = ordered.slice(1,-1).map(address=>({ location: address, stopover:true }));
+            const req = { origin: ordered[0], destination: ordered[ordered.length-1], waypoints, travelMode: g.maps.TravelMode.DRIVING, optimizeWaypoints:false };
+            directionsUrl = buildDirLink(ordered);
+            await new Promise((resolve)=>{ dsvc.route(req,(res,status)=>{ if(status==="OK") dirRenderer.current.setDirections(res); resolve(); }); });
+          }
+
+          setResult({ ordered, legs, totalSeconds, totalMeters, totalMiles: totalMeters/1609.344, etaList, directionsUrl });
+          setDelivered(newDelivered);
+          setPhotos(newPhotos);
+        } catch(e){ console.error(e); setError(e.message||String(e)); } finally { setIsOptimizing(false); }
+      }
+
+      function toggleDelivered(idx){
+        setDelivered(prev => {
+          const copy = prev.slice();
+          const cur = { ...(copy[idx] || { addr: (result?.ordered[idx]||''), delivered:false, time:'' }) };
+          if (cur.delivered) { cur.delivered = false; cur.time = ""; }
+          else { cur.delivered = true; cur.time = new Date().toISOString(); }
+          copy[idx] = cur; return copy;
+        });
+      }
+
+      function undoLastDelivered(){
+        setDelivered(prev => {
+          const copy = prev.slice();
+          for (let i = copy.length - 1; i >= 1; i--) { // skip origin (0)
+            if (copy[i]?.delivered) { copy[i] = { ...copy[i], delivered:false, time:"" }; break; }
+          }
+          return copy;
+        });
+      }
+
+      function markAllDelivered(){
+        setDelivered(prev => prev.map((d, i) => i === 0 ? d : { ...d, delivered:true, time: d.time || new Date().toISOString() }));
+      }
+
+      async function addPhotoAt(idx, file){
+        try {
+          const dataUrl = await compressImageFile(file, 1400, 0.8);
+          setPhotos(prev => {
+            const copy = prev.slice();
+            if (!copy[idx]) copy[idx] = [];
+            copy[idx] = [...copy[idx], dataUrl];
+            return copy;
+          });
+        } catch(e) { alert('Failed to add photo: ' + (e.message||e)); }
+      }
+
+      function ExportCSVButton(){
+        if (!result) return null;
+        const rows = result.ordered.map((addr, idx) => {
+          const leg = result.legs[idx-1];
+          const legMi = leg ? (leg.meters/1609.344) : 0;
+          const legMin = leg ? (leg.seconds/60) : 0;
+          const cumMi = result.legs.slice(0, idx).reduce((s,x)=>s + x.meters/1609.344, 0);
+          const eta = idx === 0 ? "–" : result.etaList[idx-1].toLocaleString();
+          const d = delivered[idx] || { delivered:false, time:"" };
+          return [idx+1, addr, leg ? legMi.toFixed(2) : "0.00", leg ? legMin.toFixed(0) : "0", cumMi.toFixed(2), eta, d.delivered ? "Yes" : "", d.time ? new Date(d.time).toLocaleString() : ""];
+        });
+        return (<button onClick={()=>downloadCSV(rows)} className="px-4 py-2 rounded-xl shadow bg-white hover:bg-gray-50 border text-sm">Export Manifest (CSV)</button>);
+      }
+
+      function GenerateInvoiceButton(){
+        if (!result) return null;
+        const miles = result.totalMiles; const deliveredStops = Math.max(0, result.ordered.length - 1);
+        const subtotal = computeSubtotal(miles, deliveredStops);
+        const tax = (Number(taxRate||0)/100) * subtotal; const total = subtotal + tax;
+
+        const lines = [];
+        if (!useTrailer) {
+          const over5 = Math.max(0, miles - 5);
+          lines.push(["Base pickup", 1, "$20.00", "$20.00"]);
+          lines.push(["Mileage after 5 mi", over5.toFixed(2), "$2.00/mi", \`$\${(2*over5).toFixed(2)}\`]);
+        } else {
+          const first5 = Math.min(5, miles), over5 = Math.max(0, miles - 5);
+          lines.push(["Trailer base", 1, "$30.00", "$30.00"]);
+          if (first5>0) lines.push(["Trailer miles (≤5 mi)", first5.toFixed(2), "$2.00/mi", \`$\${(2*first5).toFixed(2)}\`]);
+          if (over5>0) lines.push(["Trailer miles (>5 mi)", over5.toFixed(2), "$3.00/mi", \`$\${(3*over5).toFixed(2)}\`]);
+        }
+        if (addPharmacy) lines.push(["Pharmacy add-on", 1, "$10.00", "$10.00"]);
+        if (addRush) lines.push(["Rush add-on", 1, "$5.00", "$5.00"]);
+        const extraCt = Math.max(0, deliveredStops - 1);
+        if (Number(extraStopFee||0) > 0 && extraCt>0) lines.push(["Extra stops", extraCt, \`$\${Number(extraStopFee).toFixed(2)}\`, \`$\${(extraCt*Number(extraStopFee)).toFixed(2)}\`]);
+
+        const custTime = customerSigTime ? new Date(customerSigTime).toLocaleString() : "";
+        const drvTime = driverSigTime ? new Date(driverSigTime).toLocaleString() : "";
+
+        return (
+          <button
+            onClick={()=>openPrintPreview({
+              mode: 'invoice',
+              lines,
+              subtotal, taxRate:Number(taxRate||0), tax, total,
+              miles, duration: formatDuration(result.totalSeconds),
+              useTrailer, addPharmacy, addRush,
+              stops: result.ordered,
+              paymentMethod,
+              logoUrl,
+              customerName, driverName,
+              customerSig: customerSigDataUrl, driverSig: driverSigDataUrl,
+              customerSigTime: custTime, driverSigTime: drvTime,
+              delivered,
+              photos,
+            })}
+            className="px-4 py-2 rounded-xl shadow bg-white hover:bg-gray-50 border text-sm"
+          >
+            Generate Invoice (Print / PDF)
+          </button>
+        );
+      }
+
+      function GenerateReceiptButton(){
+        if (!result) return null;
+        const custTime = customerSigTime ? new Date(customerSigTime).toLocaleString() : "";
+        const drvTime = driverSigTime ? new Date(driverSigTime).toLocaleString() : "";
+        return (
+          <button
+            onClick={()=>openPrintPreview({
+              mode: 'receipt',
+              lines: [], subtotal: 0, taxRate: 0, tax: 0, total: 0,
+              miles: result.totalMiles, duration: formatDuration(result.totalSeconds),
+              useTrailer, addPharmacy, addRush,
+              stops: result.ordered, paymentMethod, logoUrl,
+              customerName, driverName,
+              customerSig: customerSigDataUrl, driverSig: driverSigDataUrl,
+              customerSigTime: custTime, driverSigTime: drvTime,
+              delivered,
+              photos,
+            })}
+            className="px-4 py-2 rounded-xl shadow bg-white hover:bg-gray-50 border text-sm"
+          >
+            Generate Receipt (No Prices)
+          </button>
+        );
+      }
+
+      function DriverModeToggle(){
+        const link = \`\${window.location.origin}\${window.location.pathname}?driver=1\`;
+        function requestPINThen(action){
+          const input = window.prompt("Enter 4-digit PIN to exit Driver Mode:") || "";
+          if (input === ownerPIN) { setAdminUnlocked(true); action(); }
+          else { alert("Incorrect PIN."); }
+        }
+        function handleToggle(next){
+          if (driverMode && !next) {
+            if (ownerPIN && !adminUnlocked) return requestPINThen(()=> setDriverMode(false));
+          }
+          setDriverMode(next);
+        }
+        return (
+          <div className="flex items-center gap-2">
+            <label className="flex items-center gap-2 text-sm">
+              <input type="checkbox" className="scale-110" checked={driverMode} onChange={(e)=>handleToggle(e.target.checked)} />
+              Driver Mode (hide prices)
+            </label>
+            <button
+              type="button"
+              className="text-xs px-2 py-1 rounded-lg border"
+              onClick={()=>{ navigator.clipboard?.writeText(link); alert("Driver link copied: " + link); }}
+            >Copy driver link</button>
+            {driverMode && ownerPIN && !adminUnlocked && (
+              <button type="button" className="text-xs px-2 py-1 rounded-lg border" onClick={()=>{
+                const input = window.prompt("Enter 4-digit PIN to unlock:") || "";
+                if (input === ownerPIN) { setAdminUnlocked(true); alert("Unlocked."); } else { alert("Incorrect PIN."); }
+              }}>Unlock (PIN)</button>
+            )}
+          </div>
+        );
+      }
+
+      function PhotosCell({ idx }){
+        const inputRef = useRef(null);
+        const count = photos[idx]?.length || 0;
+        return (
+          <div className="flex items-center gap-2">
+            <button type="button" className="px-2 py-1 text-xs border rounded-lg" onClick={()=>inputRef.current?.click()}>📷 Add photo</button>
+            <input ref={inputRef} type="file" accept="image/*" capture="environment" className="hidden" onChange={async (e)=>{ const f = e.target.files?.[0]; if (f) { await addPhotoAt(idx, f); e.target.value = ""; } }} />
+            {count>0 && <span className="text-xs text-gray-600">{count} photo{count>1?'s':''}</span>}
+          </div>
+        );
+      }
+
+      function PrintPreviewOverlay(){
+        if (!printDoc.open) return null;
+        return (
+          <div className="fixed inset-0 z-50 bg-black/50 flex items-center justify-center p-4">
+            <div className="bg-white w-full max-w-4xl h-[80vh] rounded-2xl shadow-xl overflow-hidden flex flex-col">
+              <div className="p-3 border-b flex items-center justify-between">
+                <div className="font-semibold">Print Preview</div>
+                <div className="flex gap-2">
+                  <button className="px-3 py-1 border rounded-lg" onClick={()=>{ const win = printFrameRef.current?.contentWindow; win?.focus(); win?.print(); }}>Print</button>
+                  <button className="px-3 py-1 border rounded-lg" onClick={()=>setPrintDoc({ open:false, html:"" })}>Close</button>
+                </div>
+              </div>
+              <iframe ref={printFrameRef} title="print-frame" className="flex-1" srcDoc={printDoc.html} />
+            </div>
+          </div>
+        );
+      }
+
+      return (
+        <div className="min-h-screen bg-gray-50 text-gray-900">
+          <header className="sticky top-0 z-10 bg-white/80 backdrop-blur border-b">
+            <div className="max-w-6xl mx-auto px-4 py-3 flex items-center gap-3">
+              <div className="w-10 h-10 rounded-2xl bg-blue-600 flex items-center justify-center text-white font-bold">RBD</div>
+              <div className="flex-1">
+                <h1 className="text-xl font-semibold leading-tight">River Bridge Route Optimizer</h1>
+                <p className="text-xs text-gray-500">Plan routes, capture signatures, mark delivered, attach photos, and print paperwork.</p>
+              </div>
+              <DriverModeToggle />
+            </div>
+          </header>
+
+          <main className="max-w-6xl mx-auto p-4 grid md:grid-cols-2 gap-4">
+            {/* LEFT: Controls */}
+            <section className="space-y-3">
+              <div className="rounded-2xl bg-white shadow p-4 space-y-3">
+                <h2 className="font-semibold text-lg">1) Connect Google</h2>
+                <label className="block text-sm font-medium">Google Maps API Key</label>
+                <input type="password" placeholder="AIza..." className="w-full border rounded-xl px-3 py-2" value={apiKey} onChange={(e)=>setApiKey(e.target.value)} />
+                <div className="flex gap-2 flex-wrap items-center">
+                  <button className={classNames("px-4 py-2 rounded-xl text-white", isLoadedMaps ? "bg-green-600" : "bg-blue-600 hover:bg-blue-700")} onClick={ensureMapsLoaded} disabled={isLoadingMaps || !apiKey}>
+                    {isLoadedMaps ? "Google Connected" : (isLoadingMaps ? "Connecting..." : "Load Google Maps")}
+                  </button>
+                  <span className="text-xs text-gray-500">Enable: Maps JS, Distance Matrix, Directions</span>
+                </div>
+              </div>
+
+              <div className="rounded-2xl bg-white shadow p-4 space-y-3">
+                <h2 className="font-semibold text-lg">2) Addresses</h2>
+                <div className="grid md:grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-sm font-medium">Start (Depot) – optional</label>
+                    <input type="text" className="w-full border rounded-xl px-3 py-2" placeholder="917 Martin Luther King Ave, Vidalia, LA 71373" value={startAddress} onChange={(e)=>setStartAddress(e.target.value)} />
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium">End (Final Stop) – optional</label>
+                    <input type="text" className="w-full border rounded-xl px-3 py-2" placeholder="(blank for round trip)" value={endAddress} onChange={(e)=>setEndAddress(e.target.value)} disabled={roundTrip} />
+                  </div>
+                </div>
+                <div className="flex items-center gap-2 pt-1">
+                  <input id="roundTrip" type="checkbox" className="scale-110" checked={roundTrip} onChange={(e)=>setRoundTrip(e.target.checked)} />
+                  <label htmlFor="roundTrip" className="text-sm">Return to Start (Round Trip)</label>
+                </div>
+                <label className="block text-sm font-medium pt-2">Delivery Stops (one per line)</label>
+                <textarea className="w-full border rounded-xl px-3 py-2 h-44" placeholder={`Example:\nCVS Pharmacy, 483 John R Junkin Dr, Natchez, MS\nLowe's, 609 S Promenade, Vidalia, LA`} value={addressesText} onChange={(e)=>setAddressesText(e.target.value)} />
+                <div className="text-xs text-gray-500">Tip: If you leave Start empty, the first stop becomes the starting point.</div>
+              </div>
+
+              {!driverMode && (
+                <div className="rounded-2xl bg-white shadow p-4 space-y-3">
+                  <h2 className="font-semibold text-lg">3) Pricing Options</h2>
+                  <div className="grid md:grid-cols-2 gap-3">
+                    <div>
+                      <label className="block text-sm font-medium">Optimize By</label>
+                      <select className="w-full border rounded-xl px-3 py-2" value={optimizeBy} onChange={(e)=>setOptimizeBy(e.target.value)}>
+                        <option value="duration">Fastest Time</option>
+                        <option value="distance">Shortest Distance</option>
+                      </select>
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium">Departure Time</label>
+                      <input type="datetime-local" className="w-full border rounded-xl px-3 py-2" value={departTime} onChange={(e)=>setDepartTime(e.target.value)} />
+                    </div>
+                  </div>
+                  <div className="mt-3 grid md:grid-cols-2 gap-3">
+                    <label className="flex items-center gap-2 text-sm"><input type="checkbox" className="scale-110" checked={useTrailer} onChange={(e)=>setUseTrailer(e.target.checked)} /> Use Trailer (+$30 base; $2/mi ≤5; $3/mi >5)</label>
+                    <label className="flex items-center gap-2 text-sm"><input type="checkbox" className="scale-110" checked={addPharmacy} onChange={(e)=>setAddPharmacy(e.target.checked)} /> Pharmacy (+$10)</label>
+                    <label className="flex items-center gap-2 text-sm"><input type="checkbox" className="scale-110" checked={addRush} onChange={(e)=>setAddRush(e.target.checked)} /> Rush (+$5)</label>
+                    <label className="flex items-center gap-2 text-sm">Extra stop fee $<input type="number" min="0" step="0.01" className="w-24 border rounded-lg px-2 py-1" value={extraStopFee} onChange={(e)=>setExtraStopFee(e.target.value)} /> / stop</label>
+                    <label className="flex items-center gap-2 text-sm">Tax <input type="number" min="0" step="0.01" className="w-20 border rounded-lg px-2 py-1" value={taxRate} onChange={(e)=>setTaxRate(e.target.value)} /> %</label>
+                    <label className="flex items-center gap-2 text-sm">Payment <select className="border rounded-lg px-2 py-1" value={paymentMethod} onChange={(e)=>setPaymentMethod(e.target.value)}><option>Cash</option><option>Card</option><option>ACH</option><option>Check</option></select></label>
+                  </div>
+                  <div className="mt-3 grid md:grid-cols-2 gap-3">
+                    <div>
+                      <label className="block text-sm font-medium">Logo image URL (PNG/SVG/JPG)</label>
+                      <input type="url" placeholder="https://.../rbd-logo.png" className="w-full border rounded-xl px-3 py-2" value={logoUrl} onChange={(e)=>setLogoUrl(e.target.value)} />
+                      <div className="text-xs text-gray-500 mt-1">Transparent PNG/SVG looks best.</div>
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium">Owner PIN (4 digits)</label>
+                      <input type="password" inputMode="numeric" pattern="[0-9]*" maxLength={4} placeholder="Set a PIN" className="w-full border rounded-xl px-3 py-2" value={ownerPIN} onChange={(e)=>{ setOwnerPIN(e.target.value.replace(/\D/g, '').slice(0,4)); setAdminUnlocked(false); }} />
+                      <div className="text-xs text-gray-500 mt-1">Required to exit Driver Mode when set.</div>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* Signatures */}
+              <div className="rounded-2xl bg-white shadow p-4 space-y-3">
+                <h2 className="font-semibold text-lg">{driverMode ? '3) Signatures & Proof' : '4) Signatures & Proof (capture on phone)'}</h2>
+                <div className="grid md:grid-cols-2 gap-4">
+                  <div>
+                    <label className="block text-sm font-medium">Customer Name</label>
+                    <input type="text" className="w-full border rounded-xl px-3 py-2 mb-2" value={customerName} onChange={(e)=>setCustomerName(e.target.value)} placeholder="Customer full name" />
+                    <SignaturePad value={customerSigDataUrl} onChange={(url, when)=>{ setCustomerSigDataUrl(url||""); setCustomerSigTime(when? when.toISOString(): ""); }} />
+                    <div className="text-xs text-gray-500 mt-1">{customerSigTime ? \`Saved \${new Date(customerSigTime).toLocaleString()}\` : 'Tap Save Signature when done.'}</div>
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium">Driver Name</label>
+                    <input type="text" className="w-full border rounded-xl px-3 py-2 mb-2" value={driverName} onChange={(e)=>setDriverName(e.target.value)} placeholder="Driver full name" />
+                    <SignaturePad value={driverSigDataUrl} onChange={(url, when)=>{ setDriverSigDataUrl(url||""); setDriverSigTime(when? when.toISOString(): ""); }} />
+                    <div className="text-xs text-gray-500 mt-1">{driverSigTime ? \`Saved \${new Date(driverSigTime).toLocaleString()}\` : 'Tap Save Signature when done.'}</div>
+                  </div>
+                </div>
+              </div>
+
+              <div className="flex gap-2 mt-1 flex-wrap">
+                <button onClick={onOptimize} disabled={isOptimizing} className={classNames("px-4 py-2 rounded-xl text-white", isOptimizing ? "bg-gray-400" : "bg-blue-600 hover:bg-blue-700")}>{isOptimizing ? "Optimizing..." : "Optimize Route"}</button>
+                <ExportCSVButton />
+                {result?.directionsUrl && (<a className="px-4 py-2 rounded-xl shadow bg-white hover:bg-gray-50 border text-sm" href={result.directionsUrl} target="_blank" rel="noreferrer">Open in Google Maps</a>)}
+                {!driverMode ? <GenerateInvoiceButton /> : <GenerateReceiptButton />}
+              </div>
+              {error && (<div className="text-red-600 text-sm">{error}</div>)}
+            </section>
+
+            {/* RIGHT: Results & Map */}
+            <section className="space-y-3">
+              <div className="rounded-2xl bg-white shadow p-4">
+                <div className="flex items-center justify-between mb-2">
+                  <h2 className="font-semibold text-lg">Optimized Manifest</h2>
+                  <div className="flex gap-2">
+                    <button className="px-3 py-1 border rounded-lg text-xs" onClick={undoLastDelivered}>Undo last</button>
+                    <button className="px-3 py-1 border rounded-lg text-xs" onClick={markAllDelivered}>Mark all delivered</button>
+                  </div>
+                </div>
+                {!result ? (
+                  <div className="text-sm text-gray-500">When you optimize, your ordered stops, distances, and ETAs will appear here.</div>
+                ) : (
+                  <div className="overflow-auto">
+                    <table className="min-w-full text-sm">
+                      <thead>
+                        <tr className="text-left text-gray-600 border-b">
+                          <th className="py-2 pr-3">#</th>
+                          <th className="py-2 pr-3">Address</th>
+                          <th className="py-2 pr-3">Leg</th>
+                          <th className="py-2 pr-3">Cum.</th>
+                          <th className="py-2 pr-3">ETA</th>
+                          <th className="py-2 pr-3">Delivered</th>
+                          <th className="py-2 pr-3">Photos</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {result.ordered.map((addr, idx) => {
+                          const leg = result.legs[idx - 1];
+                          const cumMeters = result.legs.slice(0, idx).reduce((s,x)=>s + x.meters, 0);
+                          const eta = idx === 0 ? null : result.etaList[idx - 1];
+                          const d = delivered[idx] || { delivered:false, time:"" };
+                          return (
+                            <tr key={idx} className="border-b last:border-0 align-top">
+                              <td className="py-2 pr-3 font-medium">{idx + 1}</td>
+                              <td className="py-2 pr-3"><div className="font-medium">{addr}</div></td>
+                              <td className="py-2 pr-3 text-gray-700">{idx === 0 ? (<span className="text-gray-400">–</span>) : (<div>{formatDistance(leg.meters)} • {formatDuration(leg.seconds)}</div>)}</td>
+                              <td className="py-2 pr-3 text-gray-700">{formatDistance(cumMeters)}</td>
+                              <td className="py-2 pr-3">{eta ? eta.toLocaleString() : "–"}</td>
+                              <td className="py-2 pr-3">
+                                {idx === 0 ? <span className="text-gray-400">–</span> : (
+                                  <label className="inline-flex items-center gap-2">
+                                    <input type="checkbox" className="scale-110" checked={!!d.delivered} onChange={()=>toggleDelivered(idx)} />
+                                    <span className="text-xs text-gray-600">{d.time ? new Date(d.time).toLocaleTimeString() : ''}</span>
+                                  </label>
+                                )}
+                              </td>
+                              <td className="py-2 pr-3"><PhotosCell idx={idx} /></td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                      <tfoot>
+                        <tr>
+                          <td className="py-2 pr-3 font-semibold">—</td>
+                          <td className="py-2 pr-3 font-semibold">Totals</td>
+                          <td className="py-2 pr-3 font-semibold">{formatDistance(result.totalMeters)} • {formatDuration(result.totalSeconds)}</td>
+                          <td className="py-2 pr-3"></td>
+                          <td className="py-2 pr-3"></td>
+                          <td className="py-2 pr-3"></td>
+                          <td className="py-2 pr-3"></td>
+                        </tr>
+                      </tfoot>
+                    </table>
+                  </div>
+                )}
+                <div className="text-xs text-gray-500 mt-2">Photo proof is included in the printout. It is not persisted to your device.</div>
+              </div>
+
+              <div className="rounded-2xl bg-white shadow p-1">
+                <div className="h-[420px] rounded-2xl overflow-hidden" ref={mapRef} />
+              </div>
+
+              <div className="rounded-2xl bg-white shadow p-4 text-xs text-gray-500 space-y-1">
+                <div><b>Privacy:</b> API key, addresses, signatures, and delivered status stay on your device. Nothing is uploaded by this app.</div>
+                <div><b>Limits:</b> Up to 25 total points (origin + waypoints + destination) per route for Google Directions.</div>
+                <div><b>Tip:</b> Share <code>?driver=1</code> as the URL parameter to open directly in Driver Mode. Set an Owner PIN to restrict exiting Driver Mode.</div>
+              </div>
+            </section>
+          </main>
+
+          <footer className="max-w-6xl mx-auto px-4 py-6 text-xs text-gray-500">© {new Date().getFullYear()} River Bridge Delivery • Built for efficient local routes.</footer>
+
+          <PrintPreviewOverlay />
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>
