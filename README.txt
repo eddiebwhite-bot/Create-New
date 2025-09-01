@@ -1,30 +1,33 @@
-# River Bridge Route Optimizer (Single-file v9a)
+River Bridge Delivery — Single-File App (v12)
+=================================================
 
-This is a single, self-contained HTML that you can open in any modern browser or drop into Netlify's drag‑and‑drop.
+What this is
+------------
+One `index.html` you can open locally or drop into Netlify Drop. No build step, no React, no Babel.
 
-## What's inside
-- Route optimization (fastest or shortest) using Google Distance Matrix
-- Map + Directions link
-- Delivered checkbox per stop with time stamp
-- Signature capture for customer + driver (touch friendly)
-- Photo proof per stop (compressed in-browser)
-- Print Preview → Invoice or Receipt (includes photos + status)
-- CSV Export with iOS/Safari-safe download
+Highlights
+----------
+- Google Maps optimization (Distance Matrix + Directions)
+- Delivered checkboxes w/ timestamps
+- Signature capture (customer & driver)
+- Photo proof per stop (compressed, included in print)
+- Pricing rules:
+  * Base: $20 + $2/mi after 5
+  * Trailer: $30 base; $2/mi for first 5 miles; $3/mi after 5
+  * + Pharmacy $10, + Rush $5, Extra stop fee, Tax %, Payment method, Logo URL
+- Driver Mode + optional PIN
+- Export CSV, Open in Google Maps, Print Invoice/Receipt
+- Rates badge under Pricing Options for quick reference
 
-## Setup
-1) Open `River-Bridge-Route-Optimizer-v9a.html` in your browser.
-2) In step **1) Connect Google**, paste your **Google Maps JavaScript API key**.
-   Enable these in Google Cloud: **Maps JavaScript API**, **Distance Matrix API**, **Directions API**.
-3) Enter addresses and click **Optimize Route**.
-4) Use **Open in Google Maps** for turn-by-turn navigation.
+How to deploy on Netlify Drop
+-----------------------------
+1) Go to https://app.netlify.com/drop
+2) Drag-and-drop this `index.html` (or a folder that contains it).
+3) Open the site URL Netlify gives you.
+4) Paste your Google Maps API key → **Load Google Maps** → add addresses → **Optimize Route**.
 
-## Deploy to Netlify (free *.netlify.app)
-- Go to https://app.netlify.com/drop
-- Drag just this `index.html` (rename the file to `index.html` first) into the page.
-- Netlify will deploy and give you a `https://<site>.netlify.app` link.
-- No domain configuration needed.
-
-## Notes
-- Max 25 total points (origin + waypoints + destination) per Google Directions.
-- All data stays on-device. No server is used.
-- For Google Drive saving and URL handoff features, use the multi-file "v9 Drive" build from our canvas instead.
+Notes
+-----
+- Your API key, addresses, options, delivered status, and PIN are saved in your browser’s localStorage.
+- Photos are NOT persisted; they live in memory and appear in the printout.
+- The app respects your device timezone via toLocaleString().
